@@ -37,25 +37,25 @@ def get_examples_set(examples_file):
 
 	return examples
 
-def encode_words(indexed_vocab, E, sentence):
-	 doc = [indexed_vocab[w] for w in sentence]
-	 embs = [E[idx] for idx in doc]
-	 return dy.concatenate(embs) 
+def pick_random_word_with_tag(words_by_tag, tag):
+	''' Used to avoid using words that do not exists in the vocab'''
+	random.choice(words_by_tag[tag])
 
-def train_model(indexed_vocab, indexed_labels, train_data, dev_data, hid_dim_size=100, emb_dim=50):
 
+def train_model(indexed_vocab, indexed_labels, train_data, dev_data, hid_dim=100, emb_dim=50):
+
+	vocab_size = len(indexed_vocab)
 	out_dim = len(indexed_labels)
-	vocab_size = len(indexed_vocab)	
 
 	# define the parameters
 	model = dy.Model()
 
 	# first layer params
-	pW1 = model.add_parameters((hid_dim_size, 5*emb_dim))
-	pb1 = model.add_parameters(hid_dim_size)
+	pW1 = model.add_parameters((hid_dim, 5*emb_dim))
+	pb1 = model.add_parameters(hid_dim)
 
 	# hidden layer params
-	pW2 = model.add_parameters((out_dim, hid_dim_size))
+	pW2 = model.add_parameters((out_dim, hid_dim))
 	pb2 = model.add_parameters(out_dim)
 
 	# word embedding - E
@@ -88,16 +88,19 @@ def train_model(indexed_vocab, indexed_labels, train_data, dev_data, hid_dim_siz
  		label = indexed_labels[label]
  		return -dy.log(dy.pick(probs,label))
 
- 	def classify(w_sequence):
+ 	def classify(w_sequence, label):
 		dy.renew_cg()
 		probs = predict_labels(w_sequence)
 		vals = probs.npvalue()
-		return np.argmax(vals)
+		return np.argmax(vals), -np.log(vals[label])
 
+	# train a model
  	trainer = dy.SimpleSGDTrainer(model)
-	closs = 0.0
-	for ITER in xrange(1000):
+ 	best_dev_loss = 1e3
+ 	best_iter = 0
+	for ITER in xrange(100):
 		random.shuffle(train_data)
+		closs = 0.0
 	 	for seq, label in train_data:
 	 		dy.renew_cg()
 	 		probs = predict_labels(seq)
@@ -105,13 +108,32 @@ def train_model(indexed_vocab, indexed_labels, train_data, dev_data, hid_dim_siz
 	 		loss = do_loss(probs,label)
 	 		closs += loss.value()
 	 		loss.backward()
-	 		trainer.update()
+	 		trainer.update(0.001)
 
+	 	# check performance on dev set
 		success_count = 0
+		dev_closs = 0.0
 		for seq, label in dev_data:
-			success_count += classify(seq) == indexed_labels[label]
+			real_label = indexed_labels[label]
+			prediction, dev_loss = classify(seq, real_label)
+			success_count += (prediction == real_label)
+			dev_closs += dev_loss
 
-		print "Train avg loss: %s | Validation rate: %s" % (closs/len(train_data), float(success_count)/len(dev_data))
+		avg_dev_loss = dev_closs/len(dev_data)
+		
+		# update best dev loss so far
+		if avg_dev_loss < best_dev_loss:
+			best_dev_loss = avg_dev_loss
+			best_iter == ITER
+
+		print "Train avg loss: %s | Dev accuracy: %s | Dev avg loss: %s" % (closs/len(train_data), float(success_count)/len(dev_data),
+		avg_dev_loss)
+
+		# Early stopping
+		# If the loss on dev-test has not decreased for 3 consecutive iterations - finish here
+		if ITER > best_iter+2:
+			break
+
 
 if __name__ == '__main__':
 
@@ -119,6 +141,7 @@ if __name__ == '__main__':
 	train_set = get_examples_set(POS_TRAIN_FILE)
 	dev_set = get_examples_set(POS_DEV_FILE)
 
+	# words vocabulary and labels set
 	vocab = set([ex[0] for ex in train_set])
 	labels = set([ex[1] for ex in train_set])
 
@@ -126,21 +149,39 @@ if __name__ == '__main__':
 	indexed_vocab = {w: i for i,w in enumerate(vocab)}
 	indexed_labels = {l: i for i,l in enumerate(labels)}
 
+	# build clusters of all tags - for efficient word swapping in dev-test later
+	words_by_tag = {}
+	for word, tag in train_set:
+		words_by_tag.setdefault(tag, []).append(word)
+
+
 	# prepare examples - for train set and validation set
-	# assemble in sequences of 5 words for each example
-	# the tag wof each sequence will be the tag of the word in the middle
+	# assemble sequences of 5 words for each example
+	# the tag of each sequence will be the tag of the word that placed in the middle
 	words_seq = [ex[0] for ex in train_set]
 	train_data = []
 	for i in range(2, len(train_set)-2):
-		ex = (words_seq[i-2:i+3], train_set[i][1])
+		ex = words_seq[i-2:i+3], train_set[i][1]
 		train_data.append(ex)
 
+	print 'Train set preprocessing is finished'
+
+	# handle dev-set words that are not in the vocabulary by replacing
+	# them with existing words that got the same tag in test-set (pick them randomly)
+	for i in range(len(dev_set)):
+		word, tag = dev_set[i]
+		if word not in vocab:
+			print 'The word %s from dev-test does not exist in the vocabulary - replace it' % word
+			dev_set[i] = random.choice(words_by_tag[tag]), tag
+
+	# prepare dev data - same as above
 	words_seq = [ex[0] for ex in dev_set]
 	dev_data = []
 	for i in range(2, len(dev_set)-2):
 		ex = (words_seq[i-2:i+3], dev_set[i][1])
 		dev_data.append(ex)
 
+	print 'Data preprocessing is finished - start training the model'
 
 	train_model(indexed_vocab, indexed_labels, train_data, dev_data)
 
