@@ -1,6 +1,7 @@
 import numpy as np
 import dynet as dy
 import random
+import sys
 
 STUDENT={'name': 'Yaniv Sheena',
          'ID': '308446764'}
@@ -181,13 +182,14 @@ class dynet_model:
         print 'Learning process is finished!'
 
 
-
-
-
 if __name__ == '__main__':
 
-    # choose task from: 'pos' | 'ner'
-    task = 'pos'
+    if len(sys.argv) != 2:
+        raise ValueError("Exacly one argument should be supplied - task type (pos,ner)")
+
+    task = sys.argv[1]
+    if task not in ('pos', 'ner'):
+        raise ValueError("Unknown task - the legal values are 'pos' or 'ner'")
 
     # get train&dev sets
     if task == 'pos':
