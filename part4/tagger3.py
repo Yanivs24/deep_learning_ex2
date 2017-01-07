@@ -2,6 +2,7 @@ import numpy as np
 import dynet as dy
 import random
 import sys
+import re
 
 STUDENT={'name': 'Yaniv Sheena',
          'ID': '308446764'}
@@ -15,6 +16,19 @@ POS_TRAIN_FILE = 'data/pos/train'
 POS_DEV_FILE   = 'data/pos/dev'
 
 
+def get_words_vec(vocab_file, wordsvec_file):
+  with open(vocab_file, 'r') as f:
+      data_lines = f.readlines()
+
+  # get words from the vocabulary
+  words = [w.strip() for w in data_lines]
+  w2ind = {w: i for i,w in enumerate(words)}
+
+  # get all pre-trained words vector (E)
+  words_vec = np.loadtxt(wordsvec_file)
+
+  return w2ind, words_vec
+
 def get_examples_set(examples_file):
     examples = []
     # the order is important here - we get a sequence
@@ -27,10 +41,15 @@ def get_examples_set(examples_file):
 
 
 class dynet_model:
-    def __init__(self, indexed_vocab, indexed_labels, hid_dim=100, emb_dim=50):
+    def __init__(self, indexed_vocab, indexed_labels, indexed_prefix, indexed_suffix, init_mapping=None, 
+                 external_E=None, hid_dim=100, emb_dim=50):
 
         self.indexed_vocab = indexed_vocab
         self.indexed_labels = indexed_labels
+        self.indexed_prefix = indexed_prefix
+        self.indexed_suffix = indexed_suffix
+        self.window_size = 5
+
         # reverse dict - from index to label
         self.i2l = {i: label for label, i in indexed_labels.iteritems()}
 
@@ -41,15 +60,29 @@ class dynet_model:
         self.model = dy.Model()
 
         # first layer params
-        self.pW1 = self.model.add_parameters((hid_dim, 5*emb_dim))
+        self.pW1 = self.model.add_parameters((hid_dim, self.window_size*emb_dim))
         self.pb1 = self.model.add_parameters(hid_dim)
 
         # hidden layer params
         self.pW2 = self.model.add_parameters((self.out_dim, hid_dim))
         self.pb2 = self.model.add_parameters(self.out_dim)
 
-        # word embedding - E
+        # word embedding - E 
         self.E = self.model.add_lookup_parameters((self.vocab_size,emb_dim))
+
+        # init word embedding matrix (E) with the given pre-trained external words
+        # the last rows of E will be still randomly init (see above) due to the addition of
+        # extra special words to the vocabulary and not to the external E
+        if external_E is not None:
+            self.E.init_from_array(external_E)
+            # init rows of E with other rows of E according to init_mapping
+            # (Init word with the vectors for their lower case version)
+            for w, i in init_mapping.iteritems():
+                self.E.init_row(indexed_vocab[w], self.E[i].value())
+
+        # embedding for words prefixes and suffixes
+        self.E_prefix = self.model.add_lookup_parameters((len(self.indexed_prefix), self.window_size*emb_dim))
+        self.E_suffix = self.model.add_lookup_parameters((len(self.indexed_suffix), self.window_size*emb_dim))
 
         # some inits
         self.dev_accuracies = []
@@ -72,10 +105,14 @@ class dynet_model:
         return W*x+b
 
     def encode_seq(self, w_sequence):
-        ''' Concatenating word vectors within w_sequence '''
-        indexes = [self.indexed_vocab[w] for w in w_sequence]
-        embs = [self.E[idx] for idx in indexes]
-        return dy.concatenate(embs) 
+        ''' Concatenating word vectors within w_sequence and prefixes and suffixes vectors.
+            Then sums up the 3 vectors '''
+        w_indexes = [self.indexed_vocab[w] for w in w_sequence]
+        w_embs = dy.concatenate([self.E[idx] for idx in w_indexes])
+        mid_word = w_sequence[2]
+        prefix_vec = self.E_prefix[self.indexed_prefix[mid_word[:3]]]
+        suffix_vec = self.E_suffix[self.indexed_suffix[mid_word[-3:]]]
+        return dy.esum([w_embs, prefix_vec, suffix_vec])
 
     def do_loss(self, probs, label):
         label = self.indexed_labels[label]
@@ -129,7 +166,7 @@ class dynet_model:
             dev_closs = 0.0
             dev_size = 0
             for seq, label in dev_data:
-                real_label = indexed_labels[label]
+                real_label = self.indexed_labels[label]
                 prediction, dev_loss = self.classify(seq, real_label)
 
                 # accumulate loss
@@ -168,38 +205,68 @@ class dynet_model:
 
 if __name__ == '__main__':
 
-    if len(sys.argv) != 2:
-        raise ValueError("Exacly one argument should be supplied - task type (pos,ner)")
+    if len(sys.argv) not in (2,3):
+        raise ValueError("1-2 argument should be supplied\n1) Task type (pos,ner)\n2) optional: [-pre]")
 
     task = sys.argv[1]
     if task not in ('pos', 'ner'):
         raise ValueError("Unknown task - the legal values are 'pos' or 'ner'")
 
+    use_pre_trained = False
+    if len(sys.argv) == 3 and sys.argv[2] == '-pre':
+        use_pre_trained = True
+        print '* Using pre-trained word vectors *'
+
     # get train&dev sets
     if task == 'pos':
         train_set = get_examples_set(POS_TRAIN_FILE)
         dev_set = get_examples_set(POS_DEV_FILE)
-        learning_rate = 0.001
+        learning_rate = 0.01
+    # NER
     else:
         train_set = get_examples_set(NER_TRAIN_FILE)
         dev_set = get_examples_set(NER_DEV_FILE)
-        learning_rate = 0.01
+        learning_rate = 0.1
 
-    # words vocabulary and labels set
-    vocab = set([ex[0] for ex in train_set])
+    # Pre-trained - get the vocabulary and the external word embedding
+    if use_pre_trained:
+        indexed_vocab, word_vectors = get_words_vec('vocab.txt', 'wordVectors.txt')
+    else: 
+        t_vocab = set([ex[0] for ex in train_set])
+        indexed_vocab = {w: i for i,w in enumerate(t_vocab)}
+
+    # get labels set for the current task and index them
     labels = set([ex[1] for ex in train_set])
-
-    # add 'special words' to vocab
-    word_not_exists = 'WORD_NOT_EXISTS!!'
-    
-    sequence_start = ['word_start_1', 'word_start_2'] # padd words
-    sequence_end = ['word_end_1', 'word_end_2']       # padd words
-    vocab.add(word_not_exists)
-    [vocab.add(word) for word in sequence_start+sequence_end]
-
-    # index words and labels using a dict
-    indexed_vocab = {w: i for i,w in enumerate(vocab)}
     indexed_labels = {l: i for i,l in enumerate(labels)}
+
+    # For each train-word that does not exist in the vocabulary, replace it
+    # with the most similar word in the vocabulary 
+    init_mapping = {}
+    if use_pre_trained:
+        for i in range(len(train_set)):
+            word, tag = train_set[i]
+            if word not in indexed_vocab:
+                lower_w = word.lower()
+                # check if lower-case version is in the vocabulary
+                if lower_w in indexed_vocab:             
+                    init_mapping[word] = indexed_vocab[lower_w] # save for init later
+
+                # append the new word to the vocabulary
+                indexed_vocab[word] = len(indexed_vocab)
+    
+    # add 'special words' to vocab
+    word_not_exists = '%#*WORD_NOT_EXISTS%#*'
+    sequence_start = ['#$1word_start#$1', '#$2word_start#$2'] # padd words
+    sequence_end = ['&^1word_end&^1', '&^2word_end&^2']       # padd words
+    special_words = [word_not_exists]+sequence_start+sequence_end
+    for word in special_words:
+        indexed_vocab[word] = len(indexed_vocab)
+
+    # get all prefixes and suffixes in the corpus
+    prefix_vocab = set(w[:3] for w in indexed_vocab) 
+    indexed_prefix= {l: i for i,l in enumerate(prefix_vocab)}
+    suffix_vocab = set(w[-3:] for w in indexed_vocab)
+    indexed_suffix = {l: i for i,l in enumerate(suffix_vocab)}
 
     # prepare examples - for train set and validation set
     # assemble sequences of 5 words for each example
@@ -220,7 +287,7 @@ if __name__ == '__main__':
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     for i in range(len(dev_set)):
         word, tag = dev_set[i]
-        if word not in vocab:
+        if word not in indexed_vocab:
             dev_set[i] = word_not_exists, tag
 
     # prepare dev data - same as above
@@ -234,14 +301,16 @@ if __name__ == '__main__':
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     # build a new dynet model 
-    my_model = dynet_model(indexed_vocab, indexed_labels)
+    if use_pre_trained:
+        my_model = dynet_model(indexed_vocab, indexed_labels, indexed_prefix, indexed_suffix, init_mapping, word_vectors)
+    else:
+        my_model = dynet_model(indexed_vocab, indexed_labels, indexed_prefix, indexed_suffix)
 
     # train the model
     my_model.train_model(train_data, dev_data, learning_rate)
 
     # write dev accuracy and loss from all the iterations in a file
     my_model.write_dev_accuracies_to_file()
-
 
     # build test-set sequences
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -259,7 +328,7 @@ if __name__ == '__main__':
     # handle test-set words that are not in the vocabulary by replacing
     # them with a special word
     for i in range(len(test_words)):
-        if test_words[i] not in vocab:
+        if test_words[i] not in indexed_vocab:
             test_words[i] = word_not_exists
 
     # pad test words
@@ -277,7 +346,7 @@ if __name__ == '__main__':
     preds = my_model.predict_blind_test(test_data)
 
     # write result file
-    test_res_file = 'data/{0}/test1.{0}'.format(task)
+    test_res_file = 'data/{0}/test4.{0}'.format(task)
     print 'Writing test predictions to %s' % test_res_file
     with open(test_res_file, 'w') as f:
         for w, pred in zip(original_test_words, preds):

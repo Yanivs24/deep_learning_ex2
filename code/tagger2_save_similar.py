@@ -1,7 +1,9 @@
 import numpy as np
 import dynet as dy
+from difflib import SequenceMatcher
 import random
 import sys
+import re
 
 STUDENT={'name': 'Yaniv Sheena',
          'ID': '308446764'}
@@ -15,19 +17,70 @@ POS_TRAIN_FILE = 'data/pos/train'
 POS_DEV_FILE   = 'data/pos/dev'
 
 
+def get_words_vec(vocab_file, wordsvec_file):
+  with open(vocab_file, 'r') as f:
+      data_lines = f.readlines()
+
+  # get words from the vocabulary
+  words = [w.strip() for w in data_lines]
+  w2ind = {w: i for i,w in enumerate(words)}
+
+  # get all pre-trained words vector (E)
+  words_vec = np.loadtxt(wordsvec_file)
+
+  return w2ind, words_vec
+
 def get_examples_set(examples_file):
     examples = []
     # the order is important here - we get a sequence
     for line in open(examples_file, 'r'):
         ex = tuple(line.strip().split())
         if len(ex) == 2:
-            examples.append(ex)
+            # conver words to lower case
+            examples.append((ex[0].lower(), ex[1]))
 
     return examples
 
+def get_most_similar_word(vocab, new_word):
+
+    # first - check if lower case version is exist in the vocabulary
+    low_case_w = new_word.lower()
+    if low_case_w in vocab:
+        return low_case_w
+
+    # check alphanumeric version
+    alnum_w = re.sub(r'\W+', '', low_case_w)
+    if alnum_w in vocab:
+        return alnum_w
+
+    # if its only digits - replace with '1'
+    if alnum_w.isdigit():
+        return '650'
+
+    # check sub-word:
+    for w in vocab:
+        if low_case_w in w or w in low_case_w:
+            return w
+        if alnum_w in w or w in alnum_w:
+            return w
+
+    # if non of the above - return random word
+    return random.choice(list(vocab))
+
+def get_most_similar_word2(vocab, new_word):
+    max_match = 0
+    max_w = None
+    for w in vocab:
+        match = SequenceMatcher(None, w, new_word).ratio()
+        if match > max_match:
+            max_match = match
+            max_w = w
+
+    return max_w
+
 
 class dynet_model:
-    def __init__(self, indexed_vocab, indexed_labels, hid_dim=100, emb_dim=50):
+    def __init__(self, indexed_vocab, indexed_labels, external_E, hid_dim=10, emb_dim=50):
 
         self.indexed_vocab = indexed_vocab
         self.indexed_labels = indexed_labels
@@ -48,8 +101,13 @@ class dynet_model:
         self.pW2 = self.model.add_parameters((self.out_dim, hid_dim))
         self.pb2 = self.model.add_parameters(self.out_dim)
 
-        # word embedding - E
+        # word embedding - E 
         self.E = self.model.add_lookup_parameters((self.vocab_size,emb_dim))
+
+        # init word embedding matrix (E) with the given pre-trained external words
+        # the last rows of E will be still randomly init (see above) due to the addition of
+        # extra special words to the vocabulary and not to the external E
+        self.E.init_from_array(external_E)
 
         # some inits
         self.dev_accuracies = []
@@ -179,27 +237,55 @@ if __name__ == '__main__':
     if task == 'pos':
         train_set = get_examples_set(POS_TRAIN_FILE)
         dev_set = get_examples_set(POS_DEV_FILE)
-        learning_rate = 0.001
+        learning_rate = 1#0.001
+    # NER
     else:
         train_set = get_examples_set(NER_TRAIN_FILE)
         dev_set = get_examples_set(NER_DEV_FILE)
-        learning_rate = 0.01
+        learning_rate = 0.1#0.01
 
-    # words vocabulary and labels set
-    vocab = set([ex[0] for ex in train_set])
+    # get the vocabulary and the external word embedding
+    indexed_vocab, word_vectors = get_words_vec('vocab.txt', 'wordVectors.txt')
+
+    # get labels set for the current task and index them
     labels = set([ex[1] for ex in train_set])
+    indexed_labels = {l: i for i,l in enumerate(labels)}
 
+    # For each train-word that does not exist in the vocabulary, replace it
+    # with the most similar word in the vocabulary
+    not_exists_words = {}
+    for i in range(len(train_set)):
+        word, tag = train_set[i]
+        if word not in indexed_vocab:
+            if word in not_exists_words:
+                continue
+            # get most similar word that already in the vocabulary
+            similar_word = get_most_similar_word2(indexed_vocab, word)
+            print "'%s' is not in the vocabulary - replace with '%s'" % (word, similar_word)
+            not_exists_words[word] = similar_word
+
+            #train_set[i] = similar_word, tag
+            # append the word to the vocabulary
+            #indexed_vocab[word] = len(indexed_vocab)
+            # append the word-vector of the similar word to the word_vectors matrix
+            #w_vec = word_vectors[indexed_vocab[similar_word]]
+            #w_vec = w_vec.reshape((1, len(w_vec)))
+            #word_vectors = np.append(word_vectors, w_vec, axis=0)
+
+    with open('words_mapping_pos.txt', 'w') as f:
+        for w1, w2 in not_exists_words.iteritems():
+            f.write("%s %s\n" % (w1, w2))
+
+    print not_exists_words
+    exit()
+    
     # add 'special words' to vocab
     word_not_exists = 'WORD_NOT_EXISTS!!'
-    
     sequence_start = ['word_start_1', 'word_start_2'] # padd words
     sequence_end = ['word_end_1', 'word_end_2']       # padd words
-    vocab.add(word_not_exists)
-    [vocab.add(word) for word in sequence_start+sequence_end]
-
-    # index words and labels using a dict
-    indexed_vocab = {w: i for i,w in enumerate(vocab)}
-    indexed_labels = {l: i for i,l in enumerate(labels)}
+    special_words = [word_not_exists]+sequence_start+sequence_end
+    for word in special_words:
+        indexed_vocab[word] = len(indexed_vocab)
 
     # prepare examples - for train set and validation set
     # assemble sequences of 5 words for each example
@@ -220,8 +306,8 @@ if __name__ == '__main__':
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     for i in range(len(dev_set)):
         word, tag = dev_set[i]
-        if word not in vocab:
-            dev_set[i] = word_not_exists, tag
+        if word not in indexed_vocab:
+            dev_set[i] = get_most_similar_word(indexed_vocab, word), tag
 
     # prepare dev data - same as above
     words_seq = sequence_start+[ex[0] for ex in dev_set]+sequence_end
@@ -234,7 +320,7 @@ if __name__ == '__main__':
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     # build a new dynet model 
-    my_model = dynet_model(indexed_vocab, indexed_labels)
+    my_model = dynet_model(indexed_vocab, indexed_labels, word_vectors)
 
     # train the model
     my_model.train_model(train_data, dev_data, learning_rate)
@@ -259,7 +345,7 @@ if __name__ == '__main__':
     # handle test-set words that are not in the vocabulary by replacing
     # them with a special word
     for i in range(len(test_words)):
-        if test_words[i] not in vocab:
+        if test_words[i] not in indexed_vocab:
             test_words[i] = word_not_exists
 
     # pad test words
