@@ -81,8 +81,8 @@ class dynet_model:
                 self.E.init_row(indexed_vocab[w], self.E[i].value())
 
         # embedding for words prefixes and suffixes
-        self.E_prefix = self.model.add_lookup_parameters((len(self.indexed_prefix), self.window_size*emb_dim))
-        self.E_suffix = self.model.add_lookup_parameters((len(self.indexed_suffix), self.window_size*emb_dim))
+        self.E_prefix = self.model.add_lookup_parameters((len(self.indexed_prefix), emb_dim))
+        self.E_suffix = self.model.add_lookup_parameters((len(self.indexed_suffix), emb_dim))
 
         # some inits
         self.dev_accuracies = []
@@ -105,14 +105,20 @@ class dynet_model:
         return W*x+b
 
     def encode_seq(self, w_sequence):
-        ''' Concatenating word vectors within w_sequence and prefixes and suffixes vectors.
-            Then sums up the 3 vectors '''
+        ''' For every word in the window sum the word vector, the prefix vector and the suffix vector,
+            then concatenate all the 5 vectors to ine long vector '''
         w_indexes = [self.indexed_vocab[w] for w in w_sequence]
-        w_embs = dy.concatenate([self.E[idx] for idx in w_indexes])
-        mid_word = w_sequence[2]
-        prefix_vec = self.E_prefix[self.indexed_prefix[mid_word[:3]]]
-        suffix_vec = self.E_suffix[self.indexed_suffix[mid_word[-3:]]]
-        return dy.esum([w_embs, prefix_vec, suffix_vec])
+        pre_indexes = [self.indexed_prefix[w[:3]] for w in w_sequence]
+        suf_indexes = [self.indexed_suffix[w[-3:]] for w in w_sequence]
+        word_vecs = [self.E[idx] for idx in w_indexes]
+        prefix_vecs = [self.E_prefix[idx] for idx in pre_indexes]
+        suffix_vecs = [self.E_suffix[idx] for idx in suf_indexes]
+        sum_vecs = [None] * len(word_vecs)
+        for i in range(len(word_vecs)):
+            sum_vecs[i] = dy.esum([word_vecs[i], prefix_vecs[i], suffix_vecs[i]])
+
+        return dy.concatenate(sum_vecs)
+
 
     def do_loss(self, probs, label):
         label = self.indexed_labels[label]
